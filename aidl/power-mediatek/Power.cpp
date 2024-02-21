@@ -1,30 +1,35 @@
 /*
- * SPDX-FileCopyrightText: 2020 The Android Open Source Project
- * SPDX-FileCopyrightText: 2023 The LineageOS Project
+ * Copyright (C) 2020 The Android Open Source Project
  *
- * SPDX-License-Identifier: Apache-2.0
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 #include <dlfcn.h>
-#include <time.h>
 
 #include "Power.h"
 
 #include <android-base/logging.h>
-#include <android-base/properties.h>
 
 #ifdef TAP_TO_WAKE_NODE
 #include <android-base/file.h>
 #endif
 
-using android::base::GetIntProperty;
-
-#define DLSYM_GET_FUNCTION(func_ptr, handle, func_name)          \
-    func_ptr = (typeof(func_ptr))dlsym(handle, #func_name);      \
-    if (func_ptr == NULL) {                                      \
-        LOG(ERROR) << "Could not locate symbol " #func_name "."; \
-        abort();                                                 \
-    }
+#define POWERHAL_LIB_NAME "libpowerhal.so"
+#define LIBPOWERHAL_INIT "libpowerhal_Init"
+#define LIBPOWERHAL_CUSLOCKHINT "libpowerhal_CusLockHint"
+#define LIBPOWERHAL_LOCKREL "libpowerhal_LockRel"
+#define LIBPOWERHAL_USERSCNDISABLEALL "libpowerhal_UserScnDisableAll"
+#define LIBPOWERHAL_USERSCNRESTOREALL "libpowerhal_UserScnRestoreAll"
 
 namespace aidl {
 namespace android {
@@ -38,92 +43,62 @@ extern bool isDeviceSpecificModeSupported(Mode type, bool* _aidl_return);
 extern bool setDeviceSpecificMode(Mode type, bool enabled);
 #endif
 
+const std::vector<Boost> BOOST_RANGE{ndk::enum_range<Boost>().begin(),
+                                     ndk::enum_range<Boost>().end()};
+const std::vector<Mode> MODE_RANGE{ndk::enum_range<Mode>().begin(), ndk::enum_range<Mode>().end()};
+
 Power::Power() {
-    mTouchBoostDuration = GetIntProperty(kTouchBoostDurationProperty, kDefaultTouchBoostDuration);
-    if (mTouchBoostDuration < 0 || mTouchBoostDuration > kMaxTouchBoostDuration) {
-        LOG(ERROR) << "Invalid touch boost duration: " << mTouchBoostDuration;
-        mTouchBoostDuration = kDefaultTouchBoostDuration;
-    }
-
-    mPerf = (struct libpowerhal_t*)calloc(1, sizeof(struct libpowerhal_t));
-    if (!mPerf) {
-        LOG(ERROR) << "Could not allocate memory for libpowerhal struct.";
-        abort();
-    }
-
-    mPerf->perfLib = dlopen(POWERHAL_LIB_NAME, RTLD_LAZY);
-    if (!mPerf->perfLib) {
+    powerHandle = dlopen(POWERHAL_LIB_NAME, RTLD_LAZY);
+    if (!powerHandle) {
         LOG(ERROR) << "Could not dlopen " << POWERHAL_LIB_NAME;
         abort();
     }
 
-    DLSYM_GET_FUNCTION(mPerf->Init, mPerf->perfLib, libpowerhal_Init);
-    DLSYM_GET_FUNCTION(mPerf->CusLockHint, mPerf->perfLib, libpowerhal_CusLockHint);
-    DLSYM_GET_FUNCTION(mPerf->LockRel, mPerf->perfLib, libpowerhal_LockRel);
-    DLSYM_GET_FUNCTION(mPerf->UserScnDisableAll, mPerf->perfLib, libpowerhal_UserScnDisableAll);
-    DLSYM_GET_FUNCTION(mPerf->UserScnRestoreAll, mPerf->perfLib, libpowerhal_UserScnRestoreAll);
+    libpowerhal_Init =
+        reinterpret_cast<libpowerhal_Init_handle>(dlsym(powerHandle, LIBPOWERHAL_INIT));
 
-    mPerf->Init(1);
+    if (!libpowerhal_Init) {
+        LOG(ERROR) << "Could not locate symbol " << LIBPOWERHAL_INIT;
+        abort();
+    }
+
+    libpowerhal_CusLockHint =
+        reinterpret_cast<libpowerhal_CusLockHint_handle>(dlsym(powerHandle, LIBPOWERHAL_CUSLOCKHINT));
+
+    if (!libpowerhal_CusLockHint) {
+        LOG(ERROR) << "Could not locate symbol " << LIBPOWERHAL_CUSLOCKHINT;
+        abort();
+    }
+
+    libpowerhal_LockRel =
+        reinterpret_cast<libpowerhal_LockRel_handle>(dlsym(powerHandle, LIBPOWERHAL_LOCKREL));
+
+    if (!libpowerhal_LockRel) {
+        LOG(ERROR) << "Could not locate symbol " << LIBPOWERHAL_LOCKREL;
+        abort();
+    }
+
+    libpowerhal_UserScnDisableAll =
+         reinterpret_cast<libpowerhal_UserScnDisableAll_handle>(dlsym(powerHandle, LIBPOWERHAL_USERSCNDISABLEALL));
+
+    if (!libpowerhal_UserScnDisableAll) {
+        LOG(ERROR) << "Could not locate symbol " << LIBPOWERHAL_USERSCNDISABLEALL;
+        abort();
+    }
+
+    libpowerhal_UserScnRestoreAll =
+        reinterpret_cast<libpowerhal_UserScnRestoreAll_handle>(dlsym(powerHandle, LIBPOWERHAL_USERSCNRESTOREALL));
+
+    if (!libpowerhal_UserScnRestoreAll) {
+        LOG(ERROR) << "Could not locate symbol " << LIBPOWERHAL_USERSCNRESTOREALL;
+        abort();
+    }
+
+    mLowPowerEnabled = 0;
+    libpowerhal_Init(1);
 }
 
-Power::~Power() {}
-
-long long Power::calcTimespanUs(struct timespec start, struct timespec end) {
-    long long diff_in_us = 0;
-    diff_in_us += (end.tv_sec - start.tv_sec) * USINSEC;
-    diff_in_us += (end.tv_nsec - start.tv_nsec) / NSINUS;
-    return diff_in_us;
-}
-
-void Power::handleInteractionHint(int32_t targetDuration) {
-    struct timespec currentInteractionTime;
-    long long elapsedTime;
-    int32_t durationMs = kMinInteractiveDuration;
-
-    // if targetDuration is 0, we perform a touch boost instead.
-    if (targetDuration == 0) {
-        if (mTouchBoostDuration == 0) {
-            return;
-        }
-        mPerf->CusLockHint(MTKPOWER_HINT_APP_TOUCH, mTouchBoostDuration, getpid());
-        return;
-    }
-
-    if (targetDuration > durationMs) {
-        durationMs = (targetDuration > kMaxInteractiveDuration) ? kMaxInteractiveDuration
-                                                                : targetDuration;
-    }
-
-    clock_gettime(CLOCK_MONOTONIC, &currentInteractionTime);
-    elapsedTime = calcTimespanUs(mPreviousInteractionTime, currentInteractionTime);
-
-    // don't hint if it's been less than 250ms since last boost
-    // also detect if we're doing anything resembling a fling
-    // support additional boosting in case of flings
-    if (elapsedTime < 250000 && durationMs <= 750) {
-        return;
-    }
-
-    if (durationMs <= mPreviousInteractionDuration) {
-        // don't hint if previous hint's duration covers this hint's duration
-        if (elapsedTime <= (mPreviousInteractionDuration - durationMs)) {
-            return;
-        }
-    }
-
-    mPreviousInteractionTime = currentInteractionTime;
-    mPreviousInteractionDuration = durationMs;
-
-    // most vendors don't implement the AOSP interaction hint in
-    // powerscntbl.xml, but MTKPOWER_HINT_UX_SCROLLING is guaranteed to
-    // be implemented on vendors newer than S.
-    int interactionHandle = mPerf->CusLockHint(MTKPOWER_HINT_UX_SCROLLING, durationMs, getpid());
-
-    if (mPreviousInteractionHandle > 0) {
-        mPerf->LockRel(mPreviousInteractionHandle);
-    }
-    mPreviousInteractionHandle = interactionHandle;
-}
+Power::~Power() { }
 
 ndk::ScopedAStatus Power::setMode(Mode type, bool enabled) {
     LOG(VERBOSE) << "Power setMode: " << static_cast<int32_t>(type) << " to: " << enabled;
@@ -135,35 +110,42 @@ ndk::ScopedAStatus Power::setMode(Mode type, bool enabled) {
 #endif
     switch (type) {
 #ifdef TAP_TO_WAKE_NODE
-        case Mode::DOUBLE_TAP_TO_WAKE: {
+        case Mode::DOUBLE_TAP_TO_WAKE:
+        {
             ::android::base::WriteStringToFile(enabled ? "1" : "0", TAP_TO_WAKE_NODE, true);
             break;
         }
 #endif
-        case Mode::LAUNCH: {
-            if (mLaunchHandle > 0) {
-                mPerf->LockRel(mLaunchHandle);
-                mLaunchHandle = 0;
+        case Mode::LAUNCH:
+        {
+            if (mLowPowerEnabled)
+                break;
+
+            if (mHandle != 0) {
+                libpowerhal_LockRel(mHandle);
+                mHandle = 0;
             }
 
-            if (enabled) {
-                mLaunchHandle =
-                        mPerf->CusLockHint(MTKPOWER_HINT_LAUNCH, kLaunchBoostDuration, getpid());
-            }
+            if (enabled)
+                mHandle = libpowerhal_CusLockHint(11, 30000, getpid());
+
             break;
         }
-        case Mode::INTERACTIVE: {
-            if (enabled) {
-                // Device is now in an interactive state,
-                // resume all previously performing hints.
-                mPerf->UserScnRestoreAll();
-            } else {
-                // Device is entering a non interactive state,
-                // disable all hints to save power.
-                mPerf->UserScnDisableAll();
-            }
+        case Mode::INTERACTIVE:
+        {
+            if (enabled)
+                /* Device now in interactive state,
+                   restore all currently held hints. */
+                libpowerhal_UserScnRestoreAll();
+            else
+                /* Device entering non interactive state,
+                   disable all hints to save power. */
+                libpowerhal_UserScnDisableAll();
             break;
         }
+        case Mode::LOW_POWER:
+            mLowPowerEnabled = enabled;
+            break;
         default:
             break;
     }
@@ -171,47 +153,45 @@ ndk::ScopedAStatus Power::setMode(Mode type, bool enabled) {
 }
 
 ndk::ScopedAStatus Power::isModeSupported(Mode type, bool* _aidl_return) {
-    LOG(INFO) << "Power isModeSupported: " << static_cast<int32_t>(type);
-
 #ifdef MODE_EXT
     if (isDeviceSpecificModeSupported(type, _aidl_return)) {
         return ndk::ScopedAStatus::ok();
     }
 #endif
 
-    switch (type) {
-#ifdef TAP_TO_WAKE_NODE
-        case Mode::DOUBLE_TAP_TO_WAKE:
-#endif
-        case Mode::LAUNCH:
-        case Mode::INTERACTIVE:
-            *_aidl_return = true;
-            break;
-        default:
-            break;
-    }
+    LOG(INFO) << "Power isModeSupported: " << static_cast<int32_t>(type);
+    *_aidl_return = type >= MODE_RANGE.front() && type <= MODE_RANGE.back();
 
     return ndk::ScopedAStatus::ok();
 }
 
 ndk::ScopedAStatus Power::setBoost(Boost type, int32_t durationMs) {
-    if (type == Boost::INTERACTION) {
-        LOG(VERBOSE) << "Power setBoost INTERACTION for: " << durationMs << "ms";
-        handleInteractionHint(durationMs);
+    if (mLowPowerEnabled) {
+        LOG(INFO) << "Will not perform boosts in LOW_POWER";
         return ndk::ScopedAStatus::ok();
     }
 
-    LOG(ERROR) << "Power unknown boost type: " << static_cast<int32_t>(type);
-    return ndk::ScopedAStatus::fromExceptionCode(EX_UNSUPPORTED_OPERATION);
+    int32_t intType = static_cast<int32_t>(type);
+
+    // Avoid boosts with 0 duration, as those will run indefinitely
+    if (type == Boost::INTERACTION && durationMs < 1)
+        durationMs = 80;
+
+    LOG(VERBOSE) << "Power setBoost: " << intType
+                 << ", duration: " << durationMs;
+
+    libpowerhal_CusLockHint(intType, durationMs, getpid());
+    return ndk::ScopedAStatus::ok();
 }
 
 ndk::ScopedAStatus Power::isBoostSupported(Boost type, bool* _aidl_return) {
     LOG(INFO) << "Power isBoostSupported: " << static_cast<int32_t>(type);
+    *_aidl_return = type >= BOOST_RANGE.front() && type <= BOOST_RANGE.back();
 
-    *_aidl_return = (type == Boost::INTERACTION);
     return ndk::ScopedAStatus::ok();
 }
 
+#if POWERHAL_AIDL_VERSION == 2
 ndk::ScopedAStatus Power::createHintSession(int32_t, int32_t, const std::vector<int32_t>&, int64_t,
                                             std::shared_ptr<IPowerHintSession>* _aidl_return) {
     *_aidl_return = nullptr;
@@ -222,6 +202,7 @@ ndk::ScopedAStatus Power::getHintSessionPreferredRate(int64_t* outNanoseconds) {
     *outNanoseconds = -1;
     return ndk::ScopedAStatus::fromExceptionCode(EX_UNSUPPORTED_OPERATION);
 }
+#endif
 
 }  // namespace mediatek
 }  // namespace impl
